@@ -140,13 +140,25 @@ services:
     # The platform proxy terminates TLS in front of this stack, so Caddy is
     # not in the picture and this is upstream's own
     # deploy/docker-compose.external-tls.yml shape: the app is published on
-    # loopback only, never on 0.0.0.0. The proxy reaches it over the shared
-    # coolify network, which is what actually routes the traffic.
+    # loopback only, never on 0.0.0.0.
     ports:
       - "127.0.0.1:${APP_BIND_PORT:-8000}:8000"
-    networks:
-      - coolify
-      - default
+    # No explicit networks here, on purpose.
+    #
+    # The platform attaches every service of this compose to the resource's
+    # own network, and the platform proxy sits on that same network - which
+    # is what the generated traefik.docker.network label names, so routing
+    # does not need anything more.
+    #
+    # Joining the shared "coolify" network as well would break the database
+    # connection, and not in an obvious way: that network carries a
+    # "postgres" alias belonging to another stack (the Dograh database), so
+    # the name resolves to the wrong server. The TCP connection then
+    # succeeds and the failure arrives one layer later, as
+    # "password authentication failed" - which the application reports as
+    # "database unreachable" and which hides the real cause. The other
+    # services are unaffected because the platform's own network is the only
+    # one they are on.
     # Exec form, so gunicorn is PID 1 and takes SIGTERM directly — `docker
     # stop` and every rolling upgrade then drain in-flight webhook requests
     # instead of hard-killing them after the grace period. 4 workers × 2 threads
