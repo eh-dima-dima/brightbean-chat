@@ -161,8 +161,12 @@ services:
     # one they are on.
     # Exec form, so gunicorn is PID 1 and takes SIGTERM directly — `docker
     # stop` and every rolling upgrade then drain in-flight webhook requests
-    # instead of hard-killing them after the grace period. 4 workers × 2 threads
-    # per SPEC §20.
+    # instead of hard-killing them after the grace period.
+    #
+    # 2 workers × 2 threads, not the 4 × 2 the reference stack specifies
+    # (SPEC §20): this host carries 4 CPUs at a load average around 10, so
+    # the reference count would oversubscribe it. Raise it when the
+    # deployment moves to its own host.
     #
     # No `--access-logfile`: gunicorn's access log records the full request line
     # including the query string, which is where /internal/tick?token=… and
@@ -175,11 +179,23 @@ services:
       - --bind
       - 0.0.0.0:8000
       - --workers
-      - "4"
+      - "2"
       - --threads
       - "2"
     expose:
       - "8000"
+    # Cloudflare tunnel -> Traefik HTTP entrypoint: Traefik rewrites
+    # X-Forwarded-Proto to "http", Django (SECURE_SSL_REDIRECT) answers 301 to
+    # itself. This router wins on the HTTP entrypoint and restores "https",
+    # as upstream's external-tls file requires.
+    labels:
+      - traefik.http.middlewares.bb-xfp.headers.customrequestheaders.X-Forwarded-Proto=https
+      - traefik.http.routers.bb-http.rule=Host(`brightbean.idstar.de`)
+      - traefik.http.routers.bb-http.entrypoints=http
+      - traefik.http.routers.bb-http.priority=1000
+      - traefik.http.routers.bb-http.middlewares=bb-xfp
+      - traefik.http.routers.bb-http.service=bb-app
+      - traefik.http.services.bb-app.loadbalancer.server.port=8000
     volumes:
       - media_data:/app/media
     depends_on:
