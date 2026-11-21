@@ -260,9 +260,17 @@ def call(
     """
     if not token:
         raise APIError("This Instagram connection has no access token stored.")
+    from apps.channels.instagram_oauth import FacebookPageToken
+
+    if isinstance(token, FacebookPageToken):
+        # Connected through Facebook Login for Business: a Page token, which only
+        # the Facebook Graph host accepts.
+        root = "https://graph.facebook.com"
+    else:
+        root = API_ROOT
     return request_json(
         method,
-        f"{API_ROOT}/{API_VERSION}/{path}",
+        f"{root}/{API_VERSION}/{path}",
         json=payload,
         params=params,
         headers={"Authorization": f"Bearer {token}"},
@@ -1652,9 +1660,13 @@ def recent_media(connection: ChannelConnection, *, limit: int = MEDIA_PAGE_SIZE)
     the caller is a template, and handing a view the provider's json invites
     somebody to render a key nobody vetted.
     """
+    token = access_token(connection)
+    from apps.channels.instagram_oauth import FacebookPageToken
+
     body = call(
-        access_token(connection),
-        "me/media",
+        token,
+        # A Page token's ``me`` is the Page, so address the account by id.
+        f"{connection.external_id}/media" if isinstance(token, FacebookPageToken) else "me/media",
         method="GET",
         params={"fields": MEDIA_FIELDS, "limit": max(1, min(limit, MEDIA_PAGE_SIZE))},
         timeout=BACKGROUND_TIMEOUT,

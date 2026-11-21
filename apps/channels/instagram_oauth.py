@@ -46,6 +46,7 @@ module: Meta's token endpoints take credentials in the query string.
 """
 
 import logging
+import os
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode, urljoin
@@ -130,6 +131,41 @@ REFRESH_MARGIN = timedelta(days=7)
 #: assuming *less* is the safe direction, because the cost of refreshing early is
 #: one API call and the cost of refreshing late is a dead channel.
 DEFAULT_TOKEN_LIFETIME = timedelta(days=50)
+
+
+#: Marker stored in ``credentials`` for a connection made through Facebook Login
+#: for Business (the "Unified login" Meta now gives new apps): its token is a
+#: *Page* token and every Graph call goes to ``graph.facebook.com``.
+API_KEY = "api"
+API_FACEBOOK = "facebook"
+FB_LOGIN_ROOT = "https://www.facebook.com"
+FB_PAGE_TOKEN_LIFETIME = timedelta(days=3650)
+#: Meta's Instagram-over-Facebook-Login messaging needs a Page token; these are
+#: the permissions the Configuration is expected to hold.
+FB_SCOPES: tuple[str, ...] = (
+    "pages_show_list",
+    "pages_read_engagement",
+    "pages_manage_metadata",
+    "instagram_basic",
+    "instagram_manage_messages",
+    "instagram_manage_comments",
+)
+FB_WEBHOOK_FIELDS: tuple[str, ...] = ("messages", "messaging_postbacks", "messaging_referrals", "message_reactions")
+
+
+class FacebookPageToken(str):
+    """A Page access token. ``providers.instagram.call`` sends it to graph.facebook.com.
+
+    A ``str`` subclass so every existing caller keeps passing the token around
+    unchanged; only ``call`` looks at the type.
+    """
+
+    __slots__ = ()
+
+
+def facebook_config_id() -> str:
+    """The Facebook Login for Business Configuration ID, or "" for the legacy flow."""
+    return os.environ.get("PLATFORM_INSTAGRAM_CONFIG_ID", "").strip()
 
 
 class InstagramCredentialsMissingError(Exception):
@@ -240,6 +276,22 @@ def read_state(raw: str) -> dict[str, str] | None:
 
 def authorize_url(*, client_id: str, state: str) -> str:
     """Where to send the operator's browser to authorise this app."""
+    config_id = facebook_config_id()
+    if config_id:
+        from apps.channels.providers.messenger import GRAPH_VERSION
+
+        fb_query = urlencode(
+            {
+                "client_id": client_id,
+                "redirect_uri": callback_url(),
+                "state": state,
+                "scope": ",".join(FB_SCOPES),
+                "response_type": "code",
+                "config_id": config_id,
+                "override_default_response_type": "true",
+            }
+        )
+        return f"{FB_LOGIN_ROOT}/{GRAPH_VERSION}/dialog/oauth?{fb_query}"
     query = urlencode(
         {
             "client_id": client_id,
@@ -282,6 +334,66 @@ def exchange_code(*, code: str, client_id: str, client_secret: str) -> tuple[str
     if not isinstance(token, str) or not token:
         raise APIError("Instagram returned no access token for that code")
     return token, str(user_id) if user_id is not None else ""
+
+
+def exchange_code_facebook(*, code: str, client_id: str, client_secret: str) -> str:
+    """Code -> long-lived Facebook *user* token (Facebook Login for Business).
+
+    Same two POSTed exchanges as Messenger's, with this flow's redirect URI.
+    """
+    from apps.channels.messenger_oauth import _oauth_token
+
+    short_lived = _oauth_token(
+        {"client_id": client_id, "client_secret": client_secret, "redirect_uri": callback_url(), "code": code}
+    )
+    return _oauth_token(
+        {
+            "grant_type": "fb_exchange_token",
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "fb_exchange_token": short_lived,
+        }
+    )
+
+
+def list_facebook_instagram_accounts(user_token: str) -> list[dict[str, str]]:
+    """Instagram professional accounts behind the Pages this person shared.
+
+    ``[{"user_id", "username", "page_id", "page_token"}]``. A Page with no linked
+    Instagram account, or one the app cannot message, is skipped.
+    """
+    from apps.channels.providers.messenger import bounded_id, graph_call
+
+    body = graph_call(
+        user_token,
+        "GET",
+        "me/accounts",
+        params={"fields": "id,name,access_token,instagram_business_account{id,username}", "limit": "25"},
+        timeout=BACKGROUND_TIMEOUT,
+    )
+    rows = body.get("data")
+    accounts: list[dict[str, str]] = []
+    for item in rows if isinstance(rows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        ig = item.get("instagram_business_account")
+        page_token = item.get("access_token")
+        page_id = bounded_id(item.get("id"))
+        if not isinstance(ig, dict) or not page_id or not isinstance(page_token, str) or not page_token:
+            continue
+        ig_id = bounded_id(ig.get("id"))
+        if not ig_id:
+            continue
+        username = ig.get("username")
+        accounts.append(
+            {
+                "user_id": ig_id,
+                "username": (username.strip()[:200] if isinstance(username, str) else "") or ig_id,
+                "page_id": page_id,
+                "page_token": page_token,
+            }
+        )
+    return accounts
 
 
 def exchange_for_long_lived(*, token: str, client_secret: str) -> tuple[str, datetime]:
@@ -365,8 +477,11 @@ def access_token(connection: Any) -> str:
     token" and the caller fails the operation with a named error — the same
     contract ``providers.telegram.bot_token`` documents.
     """
-    token = _credentials(connection).get(TOKEN_KEY)
-    return token if isinstance(token, str) else ""
+    credentials = _credentials(connection)
+    token = credentials.get(TOKEN_KEY)
+    if not isinstance(token, str):
+        return ""
+    return FacebookPageToken(token) if credentials.get(API_KEY) == API_FACEBOOK else token
 
 
 def token_expires_at(connection: Any) -> datetime | None:
@@ -388,7 +503,9 @@ def token_expires_at(connection: Any) -> datetime | None:
     return parsed if timezone.is_aware(parsed) else parsed.replace(tzinfo=UTC)
 
 
-def store_credentials(connection: Any, *, token: str, expires_at: datetime, user_id: str = "") -> None:
+def store_credentials(
+    connection: Any, *, token: str, expires_at: datetime, user_id: str = "", facebook: bool = False
+) -> None:
     """Write the token and its expiry. The only place either is written.
 
     Replaces rather than merges: a reconnect issues a brand-new token, and
@@ -401,6 +518,8 @@ def store_credentials(connection: Any, *, token: str, expires_at: datetime, user
     payload: dict[str, Any] = {TOKEN_KEY: token, EXPIRES_KEY: expires_at.isoformat()}
     if user_id:
         payload[USER_ID_KEY] = user_id
+    if facebook:
+        payload[API_KEY] = API_FACEBOOK
     connection.credentials = payload  # type: ignore[assignment]
 
 
