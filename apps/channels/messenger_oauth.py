@@ -46,6 +46,7 @@ tenant id to fuzz, and what stands in for the sweep is the state check above.
 """
 
 import logging
+import os
 import secrets
 from dataclasses import dataclass
 from typing import Any
@@ -188,16 +189,22 @@ def authorize_url(*, client_id: str, state: str) -> str:
     """
     from apps.channels.providers.messenger import GRAPH_VERSION
 
-    query = urlencode(
-        {
-            "client_id": client_id,
-            "redirect_uri": callback_url(),
-            "state": state,
-            "scope": ",".join(SCOPES),
-            "response_type": "code",
-            "auth_type": "rerequest",
-        }
-    )
+    params = {
+        "client_id": client_id,
+        "redirect_uri": callback_url(),
+        "state": state,
+        "scope": ",".join(SCOPES),
+        "response_type": "code",
+        "auth_type": "rerequest",
+    }
+    # Facebook Login for Business apps ignore ``scope``: permissions and the page
+    # picker come from a Configuration. Without ``config_id`` such an app grants
+    # nothing and ``/me/accounts`` comes back empty ("granted no pages").
+    config_id = os.environ.get("PLATFORM_MESSENGER_CONFIG_ID", "").strip()
+    if config_id:
+        params["config_id"] = config_id
+        params["override_default_response_type"] = "true"
+    query = urlencode(params)
     return f"{LOGIN_ROOT}/{GRAPH_VERSION}/dialog/oauth?{query}"
 
 
