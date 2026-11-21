@@ -39,6 +39,7 @@ from django.db import IntegrityError, transaction
 from django.http import Http404, HttpResponse
 from django.shortcuts import redirect, render
 from django.urls import reverse
+from django.utils import timezone
 from django.views.decorators.http import require_GET
 
 from apps.channels import instagram_oauth as oauth
@@ -209,6 +210,9 @@ def _complete(request: Any, workspace: Any, code: str) -> str:
     except oauth.InstagramCredentialsMissingError:
         return NO_CREDENTIALS
 
+    if oauth.facebook_config_id():
+        return _complete_facebook(request, workspace, code, client_id, client_secret)
+
     try:
         short_lived, _ = oauth.exchange_code(code=code, client_id=client_id, client_secret=client_secret)
         token, expires_at = oauth.exchange_for_long_lived(token=short_lived, client_secret=client_secret)
@@ -267,7 +271,72 @@ def _complete(request: Any, workspace: Any, code: str) -> str:
     return ""
 
 
-def _reconnect(workspace: Any, profile: dict[str, str], token: str, expires_at: Any) -> ChannelConnection | None:
+def _complete_facebook(request: Any, workspace: Any, code: str, client_id: str, client_secret: str) -> str:
+    """Facebook Login for Business variant of :func:`_complete`.
+
+    The operator picked their Pages in Meta's dialog, so every Instagram account
+    behind a shared Page is connected. The stored token is the Page token, which
+    ``providers.instagram.call`` sends to graph.facebook.com.
+    """
+    from apps.channels.providers.messenger import graph_call
+
+    try:
+        user_token = oauth.exchange_code_facebook(code=code, client_id=client_id, client_secret=client_secret)
+        accounts = oauth.list_facebook_instagram_accounts(user_token)
+    except APIError:
+        logger.info("Instagram connect (facebook): the token exchange failed for workspace %s.", workspace.pk)
+        return REJECTED_MESSAGE
+    if not accounts:
+        return (
+            "No Instagram professional account was found on the Facebook Pages you shared. "
+            "Link the Instagram account to the Page, then start again and select that Page."
+        )
+
+    expires_at = timezone.now() + oauth.FB_PAGE_TOKEN_LIFETIME
+    connected: list[str] = []
+    problem = ""
+    for account in accounts:
+        profile = {"user_id": account["user_id"], "username": account["username"]}
+        refusal = plan_refusal(workspace)
+        if refusal:
+            problem = refusal
+            break
+        try:
+            graph_call(
+                account["page_token"],
+                "POST",
+                f"{account['page_id']}/subscribed_apps",
+                params={"subscribed_fields": ",".join(oauth.FB_WEBHOOK_FIELDS)},
+            )
+        except APIError:
+            logger.info("Instagram connect (facebook): page subscription failed for workspace %s.", workspace.pk)
+        connection = ChannelConnection(
+            workspace=workspace,
+            platform=Platform.INSTAGRAM.value,
+            display_name=f"@{profile['username']}"[:200],
+            external_id=profile["user_id"],
+            status=ConnectionStatus.ACTIVE,
+        )
+        oauth.store_credentials(
+            connection, token=account["page_token"], expires_at=expires_at, user_id=profile["user_id"], facebook=True
+        )
+        try:
+            with transaction.atomic():
+                connection.save()
+        except IntegrityError:
+            existing = _reconnect(workspace, profile, account["page_token"], expires_at, facebook=True)
+            if existing is None:
+                problem = DUPLICATE_ACCOUNT_ERROR
+                continue
+        connected.append(connection.display_name)
+    if connected:
+        messages.success(request, f"Connected {', '.join(connected)}.")
+    return problem
+
+
+def _reconnect(
+    workspace: Any, profile: dict[str, str], token: str, expires_at: Any, *, facebook: bool = False
+) -> ChannelConnection | None:
     """Refresh **this workspace's** existing row for the same account, if any.
 
     Reconnecting is the ordinary way out of ``needs_reauth``, and it has to work
@@ -287,7 +356,9 @@ def _reconnect(workspace: Any, profile: dict[str, str], token: str, expires_at: 
     )
     if connection is None:
         return None
-    oauth.store_credentials(connection, token=token, expires_at=expires_at, user_id=profile["user_id"])
+    oauth.store_credentials(
+        connection, token=token, expires_at=expires_at, user_id=profile["user_id"], facebook=facebook
+    )
     connection.display_name = f"@{profile['username']}"[:200]
     connection.status = ConnectionStatus.ACTIVE
     connection.save(update_fields=["credentials", "display_name", "status", "updated_at"])
