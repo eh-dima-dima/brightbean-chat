@@ -62,6 +62,7 @@ from apps.channels.forms import DUPLICATE_ACCOUNT_ERROR
 from apps.channels.models import ChannelConnection, ConnectionStatus
 from apps.channels.plan import plan_refusal
 from apps.channels.providers import messenger as messenger_adapter
+from apps.channels.providers.base import BACKGROUND_TIMEOUT
 from apps.channels.providers.exceptions import APIError
 from apps.common.encryption import decrypt_value, encrypt_value
 from apps.common.platforms import Platform
@@ -269,6 +270,9 @@ def messenger_pages(request: WorkspaceRequest, workspace_id: str) -> HttpRespons
         _clear_pending(request)
         messages.error(request, OAUTH_FAILED)
         return redirect(reverse("channels:messenger_connect", kwargs={"workspace_id": workspace_id}))
+
+    if not pages:
+        _log_granted_permissions(token, request.workspace.pk)
 
     error = ""
     if request.method == "POST":
@@ -495,3 +499,24 @@ def messenger_posts(request: WorkspaceRequest, workspace_id: str) -> HttpRespons
     if not context["posts"] and not context["reason"]:
         context["reason"] = "This page has no posts yet."
     return render(request, "channels/_messenger_posts.html", context)
+
+
+def _log_granted_permissions(user_token: str, workspace_pk: Any) -> None:
+    """Diagnostics for an empty ``/me/accounts``: which permissions Meta granted.
+
+    Logs permission names and statuses only, never a token. Best effort.
+    """
+    from apps.channels.providers.messenger import graph_call
+
+    try:
+        body = graph_call(user_token, "GET", "me/permissions", timeout=BACKGROUND_TIMEOUT)
+    except APIError:
+        logger.info("Messenger connect: no pages for workspace %s and me/permissions failed.", workspace_pk)
+        return
+    rows = body.get("data")
+    granted = (
+        sorted(f"{r.get('permission')}={r.get('status')}" for r in rows if isinstance(r, dict))
+        if isinstance(rows, list)
+        else []
+    )
+    logger.info("Messenger connect: no pages for workspace %s; permissions: %s", workspace_pk, granted)
